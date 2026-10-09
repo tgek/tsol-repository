@@ -1,0 +1,7 @@
+{
+  "name": "greeter",
+  "version": "0.2.0",
+  "description": "A TsolOS greeting program",
+  "dependencies": ["hello"],
+  "files": ["files/*"]
+}

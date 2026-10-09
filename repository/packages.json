@@ -1,0 +1,51 @@
+{
+  "repository": "Tsol Official",
+  "version": 1,
+  "packages": {
+    "hello": {
+      "name": "hello",
+      "version": "0.1.0",
+      "description": "A simple TsolOS test program",
+      "status": "available",
+      "source": "packages/hello/files/hello",
+      "archive": "hello-0.1.0.tsol",
+      "sha256": "309567b7978d58f7aab182900cc724107a075322609e53c84eea642380fef2a2"
+    },
+    "goodbye": {
+      "name": "goodbye",
+      "version": "0.1.0",
+      "description": "A second TsolOS test program",
+      "status": "available",
+      "source": "packages/goodbye/files/goodbye"
+    },
+    "tsol-shell": {
+      "name": "tsol-shell",
+      "version": "0.1.0",
+      "description": "The TsolOS desktop shell",
+      "status": "planned"
+    },
+    "tsol-settings": {
+      "name": "tsol-settings",
+      "version": "0.1.0",
+      "description": "TsolOS system settings",
+      "status": "planned"
+    },
+    "tsol-welcome": {
+      "name": "tsol-welcome",
+      "version": "0.1.0",
+      "description": "Welcome application for TsolOS",
+      "status": "planned"
+    },
+    "greeter": {
+      "name": "greeter",
+      "version": "0.2.0",
+      "archive": "greeter-0.2.0.tsol",
+      "sha256": "8fb6ecfeeb9266fa5e6e9a13ec50bbcfcf58a831c095670ed78892de85895cd9",
+      "dependencies": [
+        "hello"
+      ],
+      "description": "",
+      "status": "available"
+    }
+  }
+}
