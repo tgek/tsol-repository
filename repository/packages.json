@@ -7,16 +7,20 @@
       "version": "0.1.0",
       "description": "A simple TsolOS test program",
       "status": "available",
-      "source": "packages/hello/files/hello",
+      "source": "packages/hello/files",
       "archive": "hello-0.1.0.tsol",
-      "sha256": "309567b7978d58f7aab182900cc724107a075322609e53c84eea642380fef2a2"
+      "sha256": "9304f8c4ecb41e5d7095cff17ed778d8ba45e1e7f11c271fc0c73c11102b66ea",
+      "dependencies": []
     },
     "goodbye": {
       "name": "goodbye",
       "version": "0.1.0",
       "description": "A second TsolOS test program",
       "status": "available",
-      "source": "packages/goodbye/files/goodbye"
+      "source": "packages/goodbye/files",
+      "archive": "goodbye-0.1.0.tsol",
+      "sha256": "a4796f128caaaddb7a27e1f3b59ce7675c58b8b0fcb816c5c82cdf2ffab4a16f",
+      "dependencies": []
     },
     "tsol-shell": {
       "name": "tsol-shell",

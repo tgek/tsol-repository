@@ -1,39 +1,48 @@
 #!/usr/bin/env python3
+"""Tsol — the TsolOS package manager."""
 
 import argparse
 import hashlib
+import io
 import json
-import re
+import os
+import shutil
 import sys
 import tarfile
-from pathlib import Path
+import tempfile
+import urllib.error
+from pathlib import Path, PurePosixPath
+from urllib.request import urlopen
 
-VERSION = "0.12.0"
+VERSION = "0.13.0"
 
-PROJECT = Path(__file__).resolve().parents[2]
-PACKAGES_DIR = PROJECT / "packages"
-REPO_DIR = PROJECT / "repository"
+PROJECT_DIR = Path.home() / "TsolOS"
+PACKAGES_DIR = PROJECT_DIR / "packages"
+REPO_DIR = PROJECT_DIR / "repository"
 REPO_FILE = REPO_DIR / "packages.json"
-TEST_ROOT = PROJECT / "test-root"
-STATE = TEST_ROOT / "var/lib/tsol/installed.json"
-BIN_DIR = TEST_ROOT / "usr/bin"
+ROOT_DIR = PROJECT_DIR / "test-root"
+STATE_FILE = ROOT_DIR / "var/lib/tsol/installed.json"
+
+REMOTE_REPO_URL = (
+    "https://raw.githubusercontent.com/tgek/tsol-repository/"
+    "main/repository/packages.json"
+)
+REMOTE_ARCHIVE_BASE = (
+    "https://raw.githubusercontent.com/tgek/tsol-repository/"
+    "main/repository"
+)
 
 
 def read_json(path, default=None):
-    path = Path(path)
     if not path.exists():
         return default
-    try:
-        with path.open(encoding="utf-8") as file:
-            return json.load(file)
-    except (OSError, json.JSONDecodeError) as error:
-        raise RuntimeError(f"Cannot read {path}: {error}") from error
+    with path.open("r", encoding="utf-8") as file:
+        return json.load(file)
 
 
 def write_json(path, data):
-    path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(path.name + ".tmp")
+    temporary = path.with_suffix(path.suffix + ".tmp")
     with temporary.open("w", encoding="utf-8") as file:
         json.dump(data, file, indent=2)
         file.write("\n")
@@ -41,550 +50,534 @@ def write_json(path, data):
 
 
 def load_repo():
-    data = read_json(REPO_FILE, {"packages": []})
-
+    data = read_json(REPO_FILE, {"repository": "Tsol Official", "version": 1,
+                                 "packages": {}})
     if not isinstance(data, dict):
         raise RuntimeError("Invalid repository metadata.")
 
-    packages = data.get("packages", [])
-
-    # Support both the original list format and the newer dictionary format.
+    packages = data.get("packages")
     if isinstance(packages, list):
         converted = {}
         for package in packages:
             if not isinstance(package, dict) or not package.get("name"):
                 raise RuntimeError("Invalid package entry in repository.")
-            if package["name"] in converted:
-                raise RuntimeError(
-                    f"Duplicate package in repository: {package['name']}"
-                )
-            converted[package["name"]] = package
+            name = package["name"]
+            if name in converted:
+                raise RuntimeError(f"Duplicate package: {name}")
+            converted[name] = package
         data["packages"] = converted
     elif not isinstance(packages, dict):
-        raise RuntimeError("Repository packages must be a list or dictionary.")
+        raise RuntimeError("Repository metadata has no valid packages.")
 
     return data
 
 
-def find_package(repo, name):
-    return repo.get("packages", {}).get(name)
+def save_repo(data):
+    write_json(REPO_FILE, data)
 
 
-def valid_name(name):
-    return bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]*", name))
+def load_state():
+    state = read_json(STATE_FILE, {"packages": {}})
+    if not isinstance(state, dict) or not isinstance(state.get("packages"), dict):
+        raise RuntimeError("Invalid installed package database.")
+    return state
 
 
-def package_archive(package):
-    archive = package.get("archive")
-    if archive:
-        path = Path(archive)
-        if not path.is_absolute():
-            path = REPO_DIR / path
-    else:
-        path = REPO_DIR / (
-            f"{package.get('name', '')}-{package.get('version', '')}.tsol"
-        )
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
-    path = path.resolve()
-    if not path.is_relative_to(REPO_DIR.resolve()):
-        raise RuntimeError("Archive path points outside the repository.")
+
+def safe_relative_path(value):
+    path = PurePosixPath(str(value))
+    if path.is_absolute() or not path.parts or ".." in path.parts:
+        raise RuntimeError(f"Unsafe package path: {value}")
     return path
 
 
-def verify_archive(package, archive):
-    if not archive.is_file():
-        raise RuntimeError(f"Archive not found: {archive}")
-
-    expected = package.get("sha256")
-    if not expected:
-        raise RuntimeError(
-            f"No SHA-256 checksum recorded for {package.get('name', archive.name)}."
-        )
-
-    digest = hashlib.sha256(archive.read_bytes()).hexdigest()
-    if digest.lower() != expected.lower():
-        raise RuntimeError(
-            f"Checksum mismatch: {package.get('name', archive.name)}"
-        )
-
-    print(f"Checksum verified: {package.get('name', archive.stem)}")
-
-
-def stage_archive(package, archive):
-    """Verify and read package files without extracting archive paths."""
-    verify_archive(package, archive)
-    staged = {}
-
-    with tarfile.open(archive, "r:gz") as tar:
-        for member in tar.getmembers():
-            path = Path(member.name)
-
-            if (
-                path.is_absolute()
-                or ".." in path.parts
-                or not path.parts
-                or not member.isfile()
-                or path.name in staged
-            ):
-                raise RuntimeError(
-                    f"Unsafe, duplicate, or unsupported archive entry: {member.name}"
-                )
-
-            source = tar.extractfile(member)
-            if source is None:
-                raise RuntimeError(f"Cannot read archive entry: {member.name}")
-
-            staged[path.name] = source.read()
-
-    if not staged:
-        raise RuntimeError("Archive contains no files.")
-
-    return staged
-
-
-def create_package(name):
-    if not valid_name(name):
-        raise RuntimeError("Invalid package name.")
-
-    source = PACKAGES_DIR / name
-    files_dir = source / "files"
-    manifest_path = source / "tsol.json"
-
-    if not source.is_dir():
-        raise RuntimeError(f"Package directory not found: {source}")
-
-    manifest = read_json(manifest_path)
+def package_manifest(name):
+    path = PACKAGES_DIR / name / "tsol.json"
+    if not path.is_file():
+        raise RuntimeError(f"Missing package manifest: {path}")
+    manifest = read_json(path)
     if not isinstance(manifest, dict):
-        raise RuntimeError(f"Missing or invalid manifest: {manifest_path}")
+        raise RuntimeError(f"Invalid manifest for {name}")
+    if manifest.get("name", name) != name:
+        raise RuntimeError(f"Manifest name does not match {name}")
+    if not manifest.get("version"):
+        raise RuntimeError(f"Manifest for {name} has no version")
+    manifest.setdefault("name", name)
+    manifest.setdefault("description", "")
+    manifest.setdefault("dependencies", [])
+    return manifest
 
-    version = str(manifest.get("version", ""))
-    if not version:
-        raise RuntimeError(f"Manifest for {name} has no version.")
 
-    dependencies = manifest.get("dependencies", [])
-    if (
-        not isinstance(dependencies, list)
-        or not all(isinstance(dep, str) and valid_name(dep) for dep in dependencies)
-    ):
-        raise RuntimeError(f"Invalid dependencies in {manifest_path}")
+def package_archive_path(package):
+    archive = package.get("archive")
+    if not archive:
+        raise RuntimeError(f"No archive available for {package.get('name')}")
+    return REPO_DIR / Path(archive).name
 
-    if name in dependencies:
-        raise RuntimeError(f"{name} cannot depend on itself.")
 
-    if len(dependencies) != len(set(dependencies)):
-        raise RuntimeError(f"Duplicate dependencies in {manifest_path}")
+def download_bytes(url):
+    request = __import__("urllib.request", fromlist=["Request"]).Request(
+        url, headers={"User-Agent": f"Tsol/{VERSION}"}
+    )
+    with urlopen(request, timeout=20) as response:
+        return response.read()
 
-    if not files_dir.is_dir():
-        raise RuntimeError(f"Missing package files directory: {files_dir}")
 
-    files = sorted(path for path in files_dir.rglob("*") if path.is_file())
+def update_repository():
+    print("Fetching Tsol repository index...")
+    try:
+        raw = download_bytes(REMOTE_REPO_URL)
+        data = json.loads(raw.decode("utf-8"))
+        if not isinstance(data, dict):
+            raise RuntimeError("Online repository index is not an object.")
+
+        packages = data.get("packages")
+        if isinstance(packages, list):
+            converted = {}
+            for package in packages:
+                if not isinstance(package, dict) or not package.get("name"):
+                    raise RuntimeError("Invalid online package entry.")
+                name = package["name"]
+                if name in converted:
+                    raise RuntimeError(f"Duplicate online package: {name}")
+                converted[name] = package
+            data["packages"] = converted
+        elif isinstance(packages, dict):
+            for name, package in packages.items():
+                if not isinstance(package, dict):
+                    raise RuntimeError(f"Invalid package entry: {name}")
+                if package.get("name", name) != name:
+                    raise RuntimeError(f"Package name mismatch: {name}")
+                package.setdefault("name", name)
+        else:
+            raise RuntimeError("Online repository has no valid packages.")
+
+        for name, package in data["packages"].items():
+            if not isinstance(name, str) or not name or not isinstance(package, dict):
+                raise RuntimeError("Invalid online package metadata.")
+            if package.get("status", "available") == "available":
+                if not package.get("archive") or not package.get("sha256"):
+                    raise RuntimeError(
+                        f"Available package {name} is missing archive/checksum metadata."
+                    )
+
+        save_repo(data)
+    except Exception as error:
+        raise RuntimeError(f"Repository update failed: {error}") from error
+
+    available = sum(
+        p.get("status", "available") == "available"
+        for p in data["packages"].values()
+    )
+    planned = sum(
+        p.get("status") == "planned" for p in data["packages"].values()
+    )
+    print("Tsol repository updated successfully.")
+    print(f"Source: {REMOTE_REPO_URL}")
+    print(f"Available packages: {available}")
+    print(f"Planned packages: {planned}")
+
+
+def package_file_sources(name):
+    directory = PACKAGES_DIR / name / "files"
+    if not directory.is_dir():
+        raise RuntimeError(f"Missing package files directory: {directory}")
+    files = sorted(path for path in directory.rglob("*") if path.is_file())
     if not files:
-        raise RuntimeError(f"No files found in {files_dir}")
-
-    return manifest, files_dir, files, version, dependencies
+        raise RuntimeError(f"Package {name} contains no files.")
+    return files
 
 
 def build_package(name):
-    manifest, files_dir, files, version, dependencies = create_package(name)
-    repo = load_repo()
-
-    for dependency in dependencies:
-        if find_package(repo, dependency) is None:
-            raise RuntimeError(
-                f"Dependency '{dependency}' is not in the repository. Build it first."
-            )
-
+    manifest = package_manifest(name)
+    files = package_file_sources(name)
+    archive_name = f"{name}-{manifest['version']}.tsol"
+    archive_path = REPO_DIR / archive_name
     REPO_DIR.mkdir(parents=True, exist_ok=True)
-    archive = REPO_DIR / f"{name}-{version}.tsol"
-    temporary = REPO_DIR / f".{name}-{version}.tsol.tmp"
 
-    with tarfile.open(temporary, "w:gz") as tar:
+    with tarfile.open(archive_path, "w:gz") as archive:
         for path in files:
-            tar.add(path, arcname=path.relative_to(files_dir).as_posix())
+            relative = path.relative_to(PACKAGES_DIR / name / "files")
+            safe_relative_path(relative.as_posix())
+            info = archive.gettarinfo(str(path), arcname=relative.as_posix())
+            info.mode = 0o755 if os.access(path, os.X_OK) else 0o644
+            with path.open("rb") as file:
+                archive.addfile(info, file)
 
-    temporary.replace(archive)
-    digest = hashlib.sha256(archive.read_bytes()).hexdigest()
-
-    old_entry = find_package(repo, name) or {}
-    repo["packages"][name] = {
+    data = load_repo()
+    old = data["packages"].get(name, {})
+    entry = {
         "name": name,
-        "version": version,
-        "archive": archive.name,
-        "sha256": digest,
-        "dependencies": dependencies,
-        "description": manifest.get(
-            "description", old_entry.get("description", "")
-        ),
-        "source": old_entry.get("source", ""),
+        "version": str(manifest["version"]),
+        "description": manifest.get("description", ""),
         "status": "available",
+        "source": f"packages/{name}/files",
+        "archive": archive_name,
+        "sha256": sha256_file(archive_path),
+        "dependencies": manifest.get("dependencies", []),
     }
+    data["packages"][name] = entry
+    save_repo(data)
 
-    write_json(REPO_FILE, repo)
-
-    print(f"Built {name} {version}")
-    print(f"Archive: {archive}")
-    print(f"SHA-256: {digest}")
-    if dependencies:
-        print("Dependencies: " + ", ".join(dependencies))
+    print(f"Built {name} {entry['version']}")
+    print(f"Archive: {archive_path}")
+    print(f"SHA-256: {entry['sha256']}")
+    print(f"Dependencies: {', '.join(entry['dependencies']) or 'none'}")
     print("Repository metadata updated.")
 
 
-def resolve_dependencies(name, repo, resolved=None, visiting=None):
-    if resolved is None:
-        resolved = []
-    if visiting is None:
-        visiting = []
+def verify_package(name):
+    data = load_repo()
+    package = data["packages"].get(name)
+    if not package:
+        raise RuntimeError(f"Package not found: {name}")
+    archive = package_archive_path(package)
+    if not archive.is_file():
+        raise RuntimeError(f"Archive not found: {archive}")
+    actual = sha256_file(archive)
+    expected = package.get("sha256")
+    if not expected or actual.lower() != expected.lower():
+        raise RuntimeError(f"Checksum verification failed for {name}")
+    print(f"Checksum verified: {name}")
+    print(f"Archive: {archive}")
+    print(f"SHA-256: {actual}")
 
+
+def get_archive(package):
+    archive = package_archive_path(package)
+    expected = package.get("sha256")
+    if archive.is_file() and expected and sha256_file(archive) == expected:
+        return archive.read_bytes()
+
+    url = f"{REMOTE_ARCHIVE_BASE}/{Path(package['archive']).name}"
+    print(f"Downloading {package['name']} from GitHub...")
+    try:
+        contents = download_bytes(url)
+    except Exception as error:
+        raise RuntimeError(f"Could not download {package['name']}: {error}") from error
+
+    actual = hashlib.sha256(contents).hexdigest()
+    if not expected or actual.lower() != expected.lower():
+        raise RuntimeError(f"Checksum verification failed for downloaded {package['name']}")
+
+    return contents
+
+
+def stage_archive(package):
+    contents = get_archive(package)
+    staged = {}
+
+    try:
+        with tarfile.open(fileobj=io.BytesIO(contents), mode="r:gz") as archive:
+            for member in archive.getmembers():
+                if not member.isfile():
+                    if member.isdir():
+                        continue
+                    raise RuntimeError(
+                        f"Unsupported archive entry in {package['name']}: {member.name}"
+                    )
+
+                relative = safe_relative_path(member.name)
+                if relative.as_posix() in staged:
+                    raise RuntimeError(f"Duplicate archive path: {relative}")
+
+                stream = archive.extractfile(member)
+                if stream is None:
+                    raise RuntimeError(f"Cannot read archive entry: {relative}")
+
+                staged[relative.as_posix()] = (
+                    stream.read(),
+                    member.mode & 0o777,
+                )
+    except (tarfile.TarError, OSError) as error:
+        raise RuntimeError(f"Invalid archive for {package['name']}: {error}") from error
+
+    if not staged:
+        raise RuntimeError(f"Package archive is empty: {package['name']}")
+    return staged
+
+
+def dependency_order(name, packages, visiting=None, visited=None):
+    visiting = set() if visiting is None else visiting
+    visited = set() if visited is None else visited
+
+    if name in visited:
+        return []
     if name in visiting:
-        raise RuntimeError(
-            "Dependency cycle detected: " + " -> ".join(visiting + [name])
-        )
+        raise RuntimeError(f"Dependency cycle detected at {name}")
+    if name not in packages:
+        raise RuntimeError(f"Package not found: {name}")
 
-    if name in resolved:
-        return resolved
+    package = packages[name]
+    if package.get("status", "available") != "available":
+        raise RuntimeError(f"Package {name} is not available.")
 
-    package = find_package(repo, name)
-    if package is None or package.get("status", "available") != "available":
-        raise RuntimeError(f"Package unavailable: {name}")
-
-    visiting.append(name)
-    dependencies = package.get("dependencies", [])
-
-    if not isinstance(dependencies, list):
-        raise RuntimeError(f"Invalid dependencies for {name}")
-
-    for dependency in dependencies:
-        resolve_dependencies(dependency, repo, resolved, visiting)
-
-    visiting.pop()
-    resolved.append(name)
-    return resolved
+    visiting.add(name)
+    order = []
+    for dependency in package.get("dependencies", []):
+        order.extend(dependency_order(dependency, packages, visiting, visited))
+    visiting.remove(name)
+    visited.add(name)
+    order.append(name)
+    return order
 
 
-def install_one(name, repo, automatic=False):
-    state = read_json(STATE, {"packages": {}})
-    installed = state.setdefault("packages", {})
-
+def install_one(name, package, staged, automatic=False):
+    state = load_state()
+    installed = state["packages"]
     if name in installed:
-        print(f"{name} is already installed.")
+        print(f"{name} {installed[name].get('version', '?')} is already installed.")
         return
 
-    package = find_package(repo, name)
-    if package is None or package.get("status", "available") != "available":
-        raise RuntimeError(f"Package unavailable: {name}")
+    entries = staged[name]
+    destinations = []
+    for relative in entries:
+        safe = safe_relative_path(relative)
+        destination = ROOT_DIR.joinpath(*safe.parts)
+        if destination.exists():
+            raise RuntimeError(
+                f"Refusing to overwrite existing file: {destination}"
+            )
+        destinations.append((relative, destination))
 
-    staged = stage_archive(package, package_archive(package))
-    BIN_DIR.mkdir(parents=True, exist_ok=True)
-
-    root = TEST_ROOT.resolve()
-    bin_root = BIN_DIR.resolve()
-
-    owned_by_others = {
-        filename
-        for record in installed.values()
-        for filename in record.get("files", [])
-    }
-
-    outputs = {}
-    for filename in staged:
-        output = (BIN_DIR / filename).resolve()
-        if not output.is_relative_to(bin_root):
-            raise RuntimeError(f"Unsafe output path: {filename}")
-
-        relative = str(output.relative_to(root))
-        if relative in owned_by_others:
-            raise RuntimeError(f"File already owned by another package: {filename}")
-        if output.exists():
-            raise RuntimeError(f"Refusing to overwrite existing file: {output}")
-
-        outputs[filename] = (output, relative)
-
-    written = []
+    created = []
     try:
-        for filename, content in staged.items():
-            output, _ = outputs[filename]
-            output.parent.mkdir(parents=True, exist_ok=True)
-            output.write_bytes(content)
-            output.chmod(0o755)
-            written.append(output)
+        for relative, destination in destinations:
+            contents, mode = entries[relative]
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(contents)
+            destination.chmod(mode)
+            created.append(destination)
 
         installed[name] = {
-            "version": package["version"],
-            "files": [relative for _, relative in outputs.values()],
+            "version": str(package["version"]),
+            "files": [relative for relative, _ in destinations],
             "dependencies": package.get("dependencies", []),
             "automatic": automatic,
         }
-        write_json(STATE, state)
+        write_json(STATE_FILE, state)
     except Exception:
-        for output in written:
-            output.unlink(missing_ok=True)
+        for path in reversed(created):
+            path.unlink(missing_ok=True)
         raise
 
     print(f"Installed {name} {package['version']}.")
 
 
-def install_package(name, repo):
-    order = resolve_dependencies(name, repo)
+def install_package(name):
+    data = load_repo()
+    packages = data["packages"]
+    order = dependency_order(name, packages)
+    state = load_state()["packages"]
 
-    for package_name in order:
-        state = read_json(STATE, {"packages": {}})
-        if package_name in state.get("packages", {}):
-            print(f"{package_name} is already installed.")
-            continue
+    to_install = [item for item in order if item not in state]
+    if not to_install:
+        print(f"{name} is already installed.")
+        return
 
-        install_one(package_name, repo, automatic=(package_name != name))
+    staged = {}
+    for item in to_install:
+        staged[item] = stage_archive(packages[item])
+        print(f"Checksum verified: {item}")
+
+    for item in to_install:
+        install_one(
+            item,
+            packages[item],
+            staged,
+            automatic=(item != name),
+        )
 
 
-def remove_package(name, cascade=True):
-    state = read_json(STATE, {"packages": {}})
-    installed = state.setdefault("packages", {})
-
+def remove_package(name):
+    state = load_state()
+    installed = state["packages"]
     if name not in installed:
         print(f"{name} is not installed.")
         return
 
-    root = TEST_ROOT.resolve()
-    record = installed[name]
+    removed = []
 
-    for relative in record.get("files", []):
-        target = (root / relative).resolve()
-        if not target.is_relative_to(root):
-            raise RuntimeError(f"Unsafe installed file path: {relative}")
-        if target.is_file():
-            target.unlink()
+    def remove_one(package_name):
+        if package_name not in installed:
+            return
+        package = installed[package_name]
+        for relative in package.get("files", []):
+            safe = safe_relative_path(relative)
+            path = ROOT_DIR.joinpath(*safe.parts)
+            if path.is_file() or path.is_symlink():
+                path.unlink()
+        installed.pop(package_name)
+        removed.append(package_name)
 
-    del installed[name]
-    write_json(STATE, state)
-    print(f"Removed {name}.")
+    remove_one(name)
 
-    if not cascade:
-        return
+    changed = True
+    while changed:
+        changed = False
+        needed = {
+            dependency
+            for package in installed.values()
+            for dependency in package.get("dependencies", [])
+        }
+        for package_name, package in list(installed.items()):
+            if package.get("automatic") and package_name not in needed:
+                remove_one(package_name)
+                changed = True
 
-    while True:
-        state = read_json(STATE, {"packages": {}})
-        installed = state.setdefault("packages", {})
-        removable = None
-
-        for dep_name, record in installed.items():
-            if not record.get("automatic", False):
-                continue
-
-            needed = any(
-                dep_name in other.get("dependencies", [])
-                for other_name, other in installed.items()
-                if other_name != dep_name
-            )
-            if not needed:
-                removable = dep_name
-                break
-
-        if removable is None:
-            break
-
-        remove_package(removable, cascade=False)
-
-
-def version_key(version):
-    parts = re.findall(r"\d+|[A-Za-z]+", str(version))
-    return tuple(
-        (1, int(part)) if part.isdigit() else (0, part.lower())
-        for part in parts
-    )
-
-
-def update_repository():
-    """Validate and summarize the local repository index."""
-    repo = load_repo()
-    packages = repo["packages"]
-
-    available = 0
-    planned = 0
-    other = 0
-
-    for name, package in sorted(packages.items()):
-        if not isinstance(package, dict) or not package.get("name"):
-            raise RuntimeError(f"Invalid package entry: {name}")
-
-        status = package.get("status", "available")
-        if status == "available":
-            available += 1
-        elif status == "planned":
-            planned += 1
-        else:
-            other += 1
-
-    print("Tsol repository checked.")
-    print(f"Repository: {REPO_FILE}")
-    print(f"Available packages: {available}")
-    print(f"Planned packages: {planned}")
-    if other:
-        print(f"Other-status packages: {other}")
-    print("Repository metadata is valid.")
-    print("Note: this checks the local index; it does not download updates.")
+    write_json(STATE_FILE, state)
+    for package_name in removed:
+        print(f"Removed {package_name}.")
 
 
 def upgrade_packages():
-    repo = load_repo()
-    state = read_json(STATE, {"packages": {}})
-    installed = state.setdefault("packages", {})
-
+    data = load_repo()
+    installed = load_state()["packages"]
     if not installed:
         print("No packages installed.")
         return
 
-    candidates = []
-
-    for name, old in list(installed.items()):
-        package = find_package(repo, name)
-
-        if package is None or package.get("status", "available") != "available":
-            print(f"Skipping {name}: unavailable in repository.")
+    upgrades = []
+    for name, current in installed.items():
+        candidate = data["packages"].get(name)
+        if not candidate or candidate.get("status", "available") != "available":
+            print(f"{name}: no available repository version.")
             continue
+        if str(candidate["version"]) != str(current["version"]):
+            upgrades.append((name, candidate, current))
 
-        old_version = str(old.get("version", ""))
-        new_version = str(package.get("version", ""))
-
-        if version_key(new_version) <= version_key(old_version):
-            print(f"{name} {old_version} is up to date.")
-            continue
-
-        try:
-            staged = stage_archive(package, package_archive(package))
-            candidates.append((name, old_version, package, staged))
-        except (RuntimeError, OSError, tarfile.TarError) as error:
-            print(f"Skipping {name}: {error}")
-
-    if not candidates:
+    if not upgrades:
         print("No packages need upgrading.")
         return
 
-    for name, old_version, package, staged in candidates:
-        state = read_json(STATE, {"packages": {}})
-        installed = state.setdefault("packages", {})
-        old = installed.get(name)
+    for name, candidate, current in upgrades:
+        staged = stage_archive(candidate)
+        old_state = load_state()
+        old_entry = old_state["packages"][name]
+        old_files = {}
 
-        if old is None:
-            print(f"Skipping {name}: no longer installed.")
-            continue
-
-        root = TEST_ROOT.resolve()
-        bin_root = BIN_DIR.resolve()
-        old_files = set(old.get("files", []))
-
-        owned_by_others = {
-            filename
-            for other_name, record in installed.items()
-            if other_name != name
-            for filename in record.get("files", [])
-        }
-
-        outputs = {}
-        conflict = None
-
-        for filename in staged:
-            output = (BIN_DIR / filename).resolve()
-            if not output.is_relative_to(bin_root):
-                conflict = f"Unsafe output path: {filename}"
-                break
-
-            relative = str(output.relative_to(root))
-            if relative in owned_by_others:
-                conflict = f"{filename} is owned by another package."
-                break
-            if output.exists() and relative not in old_files:
-                conflict = f"Refusing to overwrite unowned file: {filename}"
-                break
-
-            outputs[filename] = (output, relative)
-
-        if conflict:
-            print(f"Skipping {name}: {conflict}")
-            continue
-
-        prepared = []
-        backups = {}
-        replaced = []
+        for relative in old_entry.get("files", []):
+            safe = safe_relative_path(relative)
+            path = ROOT_DIR.joinpath(*safe.parts)
+            if path.is_file():
+                old_files[relative] = (path.read_bytes(), path.stat().st_mode & 0o777)
 
         try:
-            # Prepare replacement contents before touching installed files.
-            for filename, content in staged.items():
-                output, _ = outputs[filename]
-                output.parent.mkdir(parents=True, exist_ok=True)
-                temp = output.with_name(output.name + ".tsol-new")
-                temp.write_bytes(content)
-                temp.chmod(0o755)
-                prepared.append((temp, output))
+            for relative in old_entry.get("files", []):
+                safe = safe_relative_path(relative)
+                ROOT_DIR.joinpath(*safe.parts).unlink(missing_ok=True)
 
-            # Back up files that will be replaced.
-            for _, output in prepared:
-                if output.exists():
-                    backup = output.with_name(output.name + ".tsol-old")
-                    backup.write_bytes(output.read_bytes())
-                    backups[output] = backup
+            for relative, (contents, mode) in staged.items():
+                safe = safe_relative_path(relative)
+                destination = ROOT_DIR.joinpath(*safe.parts)
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes(contents)
+                destination.chmod(mode)
 
-            try:
-                for temp, output in prepared:
-                    temp.replace(output)
-                    replaced.append(output)
+            old_entry["version"] = str(candidate["version"])
+            old_entry["files"] = list(staged)
+            old_entry["dependencies"] = candidate.get("dependencies", [])
+            write_json(STATE_FILE, old_state)
+        except Exception:
+            for relative in staged:
+                safe = safe_relative_path(relative)
+                ROOT_DIR.joinpath(*safe.parts).unlink(missing_ok=True)
+            for relative, (contents, mode) in old_files.items():
+                safe = safe_relative_path(relative)
+                destination = ROOT_DIR.joinpath(*safe.parts)
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes(contents)
+                destination.chmod(mode)
+            raise
 
-                # Record the new state before deleting obsolete files.
-                new_files = [relative for _, relative in outputs.values()]
-                old["version"] = package["version"]
-                old["files"] = new_files
-                old["dependencies"] = package.get("dependencies", [])
-                write_json(STATE, state)
-
-                for relative in old_files - set(new_files):
-                    target = (root / relative).resolve()
-                    if target.is_relative_to(root) and target.is_file():
-                        target.unlink()
-
-            except Exception:
-                for output in reversed(replaced):
-                    backup = backups.get(output)
-                    if backup and backup.exists():
-                        backup.replace(output)
-                    else:
-                        output.unlink(missing_ok=True)
-                raise
-
-            print(f"Upgraded {name}: {old_version} -> {package['version']}")
-
-        except (OSError, RuntimeError) as error:
-            print(f"Upgrade failed for {name}: {error}")
-
-        finally:
-            for temp, _ in prepared:
-                temp.unlink(missing_ok=True)
-            for backup in backups.values():
-                backup.unlink(missing_ok=True)
+        print(
+            f"Upgraded {name}: {current['version']} -> {candidate['version']}"
+        )
 
     print("Upgrade check complete.")
 
 
+def create_package(name):
+    if not name or any(character not in "abcdefghijklmnopqrstuvwxyz"
+                       "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for character in name):
+        raise RuntimeError("Use only letters, numbers, hyphens, and underscores.")
+    directory = PACKAGES_DIR / name
+    if directory.exists():
+        raise RuntimeError(f"Package already exists: {directory}")
+
+    (directory / "files").mkdir(parents=True)
+    write_json(directory / "tsol.json", {
+        "name": name,
+        "version": "0.1.0",
+        "description": f"A TsolOS package: {name}",
+        "dependencies": [],
+    })
+    data = load_repo()
+    data["packages"][name] = {
+        "name": name,
+        "version": "0.1.0",
+        "description": f"A TsolOS package: {name}",
+        "status": "planned",
+    }
+    save_repo(data)
+    print(f"Created package: {directory}")
+    print(f"Add files to {directory / 'files'} and then run: tsol build {name}")
+
+
+def show_list():
+    for name, package in sorted(load_repo()["packages"].items()):
+        print(f"{name} {package.get('version', '?')} "
+              f"[{package.get('status', 'available')}]")
+
+
+def show_installed():
+    packages = load_state()["packages"]
+    if not packages:
+        print("No packages installed.")
+        return
+    for name, package in sorted(packages.items()):
+        print(f"{name} {package.get('version', '?')}")
+
+
+def show_info():
+    print(f"Tsol package manager {VERSION}")
+    print(f"Project: {PROJECT_DIR}")
+    print(f"Repository: {REPO_DIR}")
+    print(f"Test installation root: {ROOT_DIR}")
+    print(f"Online index: {REMOTE_REPO_URL}")
+
+
+def search_packages(query):
+    query = query.lower()
+    for name, package in sorted(load_repo()["packages"].items()):
+        description = package.get("description", "")
+        if query in name.lower() or query in description.lower():
+            print(f"{name} {package.get('version', '?')} "
+                  f"[{package.get('status', 'available')}] — {description}")
+
+
 def main():
-    parser = argparse.ArgumentParser(
-        prog="tsol",
-        description="TsolOS package manager",
-    )
-    parser.add_argument(
-        "--version",
-        action="version",
-        version=f"tsol {VERSION}",
-    )
+    parser = argparse.ArgumentParser(prog="tsol", description="Tsol package manager")
+    parser.add_argument("--version", action="version", version=f"tsol {VERSION}")
+    commands = parser.add_subparsers(dest="command", required=True)
 
-    commands = parser.add_subparsers(dest="command")
-
-    commands.add_parser("info", help="Show Tsol information")
+    commands.add_parser("info", help="Show Tsol configuration")
     commands.add_parser("list", help="List repository packages")
     commands.add_parser("installed", help="List installed packages")
-    commands.add_parser("update", help="Check local repository metadata")
+    commands.add_parser("update", help="Download the online repository index")
     commands.add_parser("upgrade", help="Upgrade installed packages")
 
     search_parser = commands.add_parser("search", help="Search packages")
     search_parser.add_argument("query")
 
-    create_parser = commands.add_parser("create", help="Create a package skeleton")
+    create_parser = commands.add_parser("create", help="Create a package")
     create_parser.add_argument("name")
 
     build_parser = commands.add_parser("build", help="Build a package archive")
@@ -601,90 +594,31 @@ def main():
 
     args = parser.parse_args()
 
-    if not args.command:
-        parser.print_help()
-        return
-
     try:
         if args.command == "info":
-            print(f"Tsol package manager {VERSION}")
-            print(f"Project: {PROJECT}")
-            print(f"Repository: {REPO_DIR}")
-            print(f"Test installation root: {TEST_ROOT}")
-
+            show_info()
         elif args.command == "list":
-            for name, package in sorted(load_repo()["packages"].items()):
-                print(
-                    f"{name} {package.get('version', '?')} "
-                    f"[{package.get('status', 'available')}]"
-                )
-
-        elif args.command == "search":
-            query = args.query.lower()
-            found = False
-            for name, package in sorted(load_repo()["packages"].items()):
-                description = str(package.get("description", ""))
-                if query in name.lower() or query in description.lower():
-                    print(
-                        f"{name} {package.get('version', '?')} - "
-                        f"{description or 'No description'}"
-                    )
-                    found = True
-            if not found:
-                print("No matching packages found.")
-
+            show_list()
         elif args.command == "installed":
-            packages = read_json(STATE, {"packages": {}}).get("packages", {})
-            if not packages:
-                print("No packages installed.")
-            for name, package in sorted(packages.items()):
-                print(f"{name} {package.get('version', '?')}")
-
+            show_installed()
         elif args.command == "update":
             update_repository()
-
-        elif args.command == "create":
-            if not valid_name(args.name):
-                raise RuntimeError("Invalid package name.")
-
-            destination = PACKAGES_DIR / args.name
-            if destination.exists():
-                raise RuntimeError(f"Package already exists: {args.name}")
-
-            (destination / "files").mkdir(parents=True)
-            write_json(
-                destination / "tsol.json",
-                {
-                    "name": args.name,
-                    "version": "0.1.0",
-                    "description": f"My {args.name} package",
-                    "dependencies": [],
-                },
-            )
-            print(f"Created package skeleton: {destination}")
-            print("Add files under its files/ directory, then run:")
-            print(f"tsol build {args.name}")
-
-        elif args.command == "build":
-            build_package(args.name)
-
-        elif args.command == "verify":
-            package = find_package(load_repo(), args.name)
-            if package is None:
-                raise RuntimeError(f"Package not found: {args.name}")
-            verify_archive(package, package_archive(package))
-
-        elif args.command == "install":
-            install_package(args.name, load_repo())
-
-        elif args.command == "remove":
-            remove_package(args.name)
-
         elif args.command == "upgrade":
             upgrade_packages()
-
-    except (RuntimeError, OSError, tarfile.TarError, json.JSONDecodeError) as error:
-        print(f"Error: {error}", file=sys.stderr)
+        elif args.command == "search":
+            search_packages(args.query)
+        elif args.command == "create":
+            create_package(args.name)
+        elif args.command == "build":
+            build_package(args.name)
+        elif args.command == "verify":
+            verify_package(args.name)
+        elif args.command == "install":
+            install_package(args.name)
+        elif args.command == "remove":
+            remove_package(args.name)
+    except (RuntimeError, OSError, ValueError, KeyError, json.JSONDecodeError) as error:
+        print(f"tsol: error: {error}", file=sys.stderr)
         sys.exit(1)
 
 
